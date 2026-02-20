@@ -1,0 +1,19 @@
+# === Experiment outputs ===
+results/
+
+# === Python cache ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# === Logs / temp ===
+*.log
+
+# === Large capture files ===
+*.pcap
+*.pcapng
+
+# === Editor / OS ===
+.DS_Store
+.vscode/

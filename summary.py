@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import math
+from bisect import bisect_left
 
 def _count_lines(p: Path) -> int:
     n = 0
@@ -74,6 +76,197 @@ def _scan_timeline_from_jsonl(p: Path) -> dict:
         "interval_est_s": interval,
         "has_gaps": has_gaps,
     }
+
+
+def _read_jsonl_rows(p: Path) -> list[dict]:
+    rows = []
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            t = obj.get("t", None)
+            if t is None:
+                continue
+            rows.append(obj)
+    # jsonl 通常已按時間排序，但保險起見
+    rows.sort(key=lambda r: r["t"])
+    return rows
+
+
+def _nearest_row_by_t(rows: list[dict], t: float) -> dict | None:
+    """
+    rows 必須依 rows[i]["t"] 遞增排序。
+    用 bisect 找到最接近 t 的那筆（v0: nearest-neighbor, 不插值）。
+    """
+    if not rows:
+        return None
+    ts = [r["t"] for r in rows]  # v0: 資料量很小（~80筆）可接受
+    i = bisect_left(ts, t)
+    if i <= 0:
+        return rows[0]
+    if i >= len(rows):
+        return rows[-1]
+    before = rows[i - 1]
+    after = rows[i]
+    return before if abs(before["t"] - t) <= abs(after["t"] - t) else after
+
+
+def _is_shell_row(obj: dict) -> bool:
+    host = (obj.get("host") or "")
+    if host.endswith("_shell"):
+        links = obj.get("links", {})
+        return isinstance(links, dict)
+    return False
+
+
+def _index_shell_rows_by_host(merged_rows: list[dict]) -> dict[str, dict]:
+    """
+    從 merged_rows 中挑出 ue*_shell 的 rows，並依 host 分組、各自按時間排序，
+    同時預先建 ts array 方便 bisect。
+    回傳：
+      {
+        "ue1_shell": {"rows":[...], "ts":[...]},
+        ...
+      }
+    """
+    by_host: dict[str, list[dict]] = {}
+    for r in merged_rows:
+        if not _is_shell_row(r):
+            continue
+        h = r.get("host") or "NO_HOST"
+        by_host.setdefault(h, []).append(r)
+
+    out: dict[str, dict] = {}
+    for h, rows in by_host.items():
+        rows.sort(key=lambda x: x["t"])
+        out[h] = {"rows": rows, "ts": [x["t"] for x in rows]}
+    return out
+
+
+def _last_row_leq_ts(rows: list[dict], ts: list[float], t: float) -> dict | None:
+    """
+    rows 與 ts 必須同長度且按時間排序。
+    回傳最後一筆 rows[i]["t"] <= t；若全部 > t，回傳第一筆（維持你 v0 的風格）。
+    """
+    if not rows:
+        return None
+    i = bisect_left(ts, t)
+    if i <= 0:
+        return rows[0]
+    return rows[i - 1]
+
+
+def build_aligned_timeseries_v0(
+    run_dir: Path,
+    merged_rel: str,
+    qdisc_rel: str,
+    out_rel: str = "30_analysis/aligned/aligned_timeseries.jsonl",
+    dt: float | None = None,
+) -> str:
+    """
+    Phase 3 v0: 將 merged + qdisc_series 對齊到同一時間軸 grid，輸出 aligned jsonl。
+    - 規則：nearest sample（不插值）
+    - 欄位：qdisc 的 delay/ecn/backlog/drop + access 的 tx_delta/share
+    回傳 out_rel（相對 run_dir 的路徑字串）
+    """
+    merged_path = run_dir / merged_rel
+    qdisc_path = run_dir / qdisc_rel
+
+    if not merged_path.exists():
+        raise FileNotFoundError(f"merged not found: {merged_path}")
+    if not qdisc_path.exists():
+        raise FileNotFoundError(f"qdisc series not found: {qdisc_path}")
+
+    # dt：優先用 merged 的 interval_est_s，其次 qdisc 的 interval_est_s，再 fallback 0.25
+    if dt is None:
+        mt = _scan_timeline_from_jsonl(merged_path)
+        qt = _scan_timeline_from_jsonl(qdisc_path)
+        dt = mt.get("interval_est_s") or qt.get("interval_est_s") or 0.25
+
+    # 共同時間窗
+    mt = _scan_timeline_from_jsonl(merged_path)
+    qt = _scan_timeline_from_jsonl(qdisc_path)
+    t0 = max(float(mt["t_min"]), float(qt["t_min"]))
+    t1 = min(float(mt["t_max"]), float(qt["t_max"]))
+
+    # 讀資料
+    merged_rows = _read_jsonl_rows(merged_path)
+    qdisc_rows = _read_jsonl_rows(qdisc_path)
+    shell_index = _index_shell_rows_by_host(merged_rows)
+
+    out_path = run_dir / out_rel
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 對齊輸出
+    # 用 floor/ceil 讓 grid 穩定
+    n_steps = int(math.floor((t1 - t0) / dt)) + 1
+
+    with open(out_path, "w", encoding="utf-8") as fo:
+        for k in range(n_steps):
+            t = t0 + k * dt
+
+            q = _nearest_row_by_t(qdisc_rows, t)
+            if q is None:
+                continue
+
+            # ✅ 只用 ue*_shell rows，且多 UE 直接加總
+            txA = txB = txC = 0
+
+            for h, pack in shell_index.items():
+                rows_h = pack["rows"]
+                ts_h = pack["ts"]
+                mh = _last_row_leq_ts(rows_h, ts_h, t)
+                if mh is None:
+                    continue
+
+                links = mh.get("links", {}) or {}
+                txA += int((links.get("A", {}) or {}).get("tx_delta", 0) or 0)
+                txB += int((links.get("B", {}) or {}).get("tx_delta", 0) or 0)
+                txC += int((links.get("C", {}) or {}).get("tx_delta", 0) or 0)
+
+            s = txA + txB + txC
+            shA = txA / s if s > 0 else 0.0
+            shB = txB / s if s > 0 else 0.0
+            shC = txC / s if s > 0 else 0.0
+
+            rec = {
+                "t": round(t, 6),
+                "qdisc": {
+                    "dev": q.get("dev"),
+                    "dualpi2_delay_c_us": q.get("dualpi2_delay_c_us"),
+                    "dualpi2_delay_l_us": q.get("dualpi2_delay_l_us"),
+                    "dualpi2_ecn_mark": q.get("dualpi2_ecn_mark"),
+                    "dualpi2_backlog_bytes": q.get("dualpi2_backlog_bytes"),
+                    "tbf_dropped": q.get("tbf_dropped"),
+                    "tbf_overlimits": q.get("tbf_overlimits"),
+                },
+                "access": {
+                    "A": {"tx_delta": txA, "share": shA},
+                    "B": {"tx_delta": txB, "share": shB},
+                    "C": {"tx_delta": txC, "share": shC},
+                },
+            }
+
+            fo.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    return out_rel
+
+
+def _autodetect_qdisc_series_rel(run_dir: Path) -> str | None:
+    """
+    不寫死 r-ethXX：自動找 10_raw/qdisc/*_series.jsonl
+    找到 1 個就回傳相對路徑；>1 個就選第一個（並可自行加 warning）。
+    """
+    qdir = run_dir / "10_raw" / "qdisc"
+    if not qdir.exists():
+        return None
+    hits = sorted(qdir.glob("*_series.jsonl"))
+    if not hits:
+        return None
+    # v0：若多個先選第一個
+    return str(hits[0].relative_to(run_dir))
 
 
 def _compute_access_usage_from_merged(p: Path) -> dict:
@@ -283,6 +476,10 @@ def generate_summary_v0(
         artifacts["qdisc_series_jsonl"] = qdisc_rel
     if policy_rel:
         artifacts["policy_jsonl"] = policy_rel
+    
+    # auto-detect qdisc series if not provided
+    if not qdisc_rel:
+        qdisc_rel = _autodetect_qdisc_series_rel(run_dir)
 
     summary = {
         "schema": {
@@ -377,7 +574,22 @@ def generate_summary_v0(
     summary["stats"]["throughput"] = tp or {}
 
 
+    # ---- Phase 3 v0: aligned timeseries ----
+    aligned_rel = None
+    if merged_rel and qdisc_rel and qc["exists"]["merged"] and qc["readable"]["merged"] and qc["exists"]["qdisc_series"] and qc["readable"]["qdisc_series"]:
+        try:
+            aligned_rel = build_aligned_timeseries_v0(
+                run_dir=run_dir,
+                merged_rel=merged_rel,
+                qdisc_rel=qdisc_rel,
+                out_rel="30_analysis/aligned/aligned_timeseries.jsonl",
+                dt=None,  # auto from logs (should be ~0.25)
+            )
+        except Exception:
+            aligned_rel = None
 
+    if aligned_rel:
+        summary["inputs"]["artifacts"]["aligned_timeseries_jsonl"] = aligned_rel
 
 
     with open(summary_path, "w", encoding="utf-8") as f:

@@ -10,6 +10,8 @@ def setup_aqm_on_bottleneck(
     delay_ms: int = 10,
     burst_kb: int = 64,
     latency_ms: int = 50,
+    dualpi2_target_ms: int = 15,
+    dualpi2_tupdate_ms: int = 16,
 ):
     """
     root netem (delay)
@@ -40,7 +42,10 @@ def setup_aqm_on_bottleneck(
         return "none"
 
     if aqm_type == "dualpi2":
-        r2.cmd(f"tc qdisc add dev {dev} {parent} handle 10: dualpi2 target 15ms tupdate 16ms")
+        r2.cmd(
+            f"tc qdisc add dev {dev} {parent} handle 10: dualpi2 "
+            f"target {int(dualpi2_target_ms)}ms tupdate {int(dualpi2_tupdate_ms)}ms"
+        )
         return "dualpi2"
 
     if aqm_type == "fq_codel":

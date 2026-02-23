@@ -13,6 +13,8 @@ from pre6g.topo import ue_access_ip, ue_internal_ip
 from pre6g.validate import verify_flow_access_mapping, verify_per_flow_access_with_tcpdump, auto_acceptance, print_flow_traffic_summary
 from pre6g.parse import extract_qdisc_series
 from pre6g.summary import generate_summary_v0, write_report_summary_v0
+from pre6g.export_plot_data import export_plot_tsv_if_aligned_exists
+from pre6g.plot import plot_minimal_for_run
 
 # ===== public API =====
 def run_experiment(net, topo, args):
@@ -60,6 +62,8 @@ def run_experiment(net, topo, args):
         delay_ms=int(args.bn_delay_ms),
         burst_kb=int(args.bn_burst_kb),
         latency_ms=int(args.bn_latency_ms),
+        dualpi2_target_ms=int(getattr(args, "dualpi2_target_ms", 15)),
+        dualpi2_tupdate_ms=int(getattr(args, "dualpi2_tupdate_ms", 16)),
     )
 
 
@@ -361,6 +365,8 @@ def run_experiment(net, topo, args):
             "burst_kb": int(args.bn_burst_kb),
             "latency_ms": int(args.bn_latency_ms),
             "bottleneck_dev": bn_dev,
+            "dualpi2_target_ms": int(getattr(args, "dualpi2_target_ms", 15)),
+            "dualpi2_tupdate_ms": int(getattr(args, "dualpi2_tupdate_ms", 16)),
         },
         "ports": sorted(set(ports)),
 
@@ -395,6 +401,29 @@ def run_experiment(net, topo, args):
     meta_all["paths"]["summary_json"] = summary_rel
     report_rel = write_report_summary_v0(run_dir)
     meta_all["paths"]["report_summary_json"] = report_rel
+
+    # ---- export plot TSV (if aligned exists) ----
+    try:
+        exp = export_plot_tsv_if_aligned_exists(run_dir)
+        meta_all["paths"]["plot_tsv"] = exp
+        if not exp.get("skipped", False):
+            print("[PLOT] wrote:", Path(exp["latency_qdisc_tsv"]).relative_to(run_dir))
+            print("[PLOT] wrote:", Path(exp["queue_vs_latency_tsv"]).relative_to(run_dir))
+        else:
+            print("[PLOT] skipped:", exp.get("reason", ""))
+    except Exception as e:
+        meta_all["paths"]["plot_tsv"] = {"skipped": True, "reason": f"exception: {e!r}"}
+        print("[PLOT] export failed:", repr(e))
+    
+    # ---- minimal plots ----
+    try:
+        plots = plot_minimal_for_run(run_dir)
+        meta_all["paths"]["plots"] = plots
+        print("[PLOT] wrote:", Path(plots["fig_latency_timeseries"]).relative_to(run_dir))
+        print("[PLOT] wrote:", Path(plots["fig_queue_vs_latency"]).relative_to(run_dir))
+    except Exception as e:
+        meta_all["paths"]["plots"] = {"skipped": True, "reason": f"{e!r}"}
+        print("[PLOT] skipped:", repr(e))
 
     Path(meta_path).write_text(json.dumps(meta_all, indent=2), encoding="utf-8")
 

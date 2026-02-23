@@ -88,7 +88,13 @@ def build_multiaccess_ue_topo(
         delay = str(p.get("delay", d_delay))
         maxq = int(p.get("max_queue", p.get("maxq", d_maxq)))
         loss = p.get("loss", d_loss)
-        kw = dict(cls=TCLink, bw=bw, delay=delay, max_queue_size=maxq)
+
+        # Dynamic HTB r2q to keep quantum ~ 3000 bytes (about 2 MTU)
+        target_quantum = 3000  # bytes
+        r2q = int((bw * 1_000_000 / 8 + target_quantum - 1) // target_quantum)  # ceil
+        r2q = max(10, min(r2q, 20000))  # clamp
+
+        kw = dict(cls=TCLink, bw=bw, delay=delay, max_queue_size=maxq, r2q=r2q)
         if loss is not None:
             kw["loss"] = float(loss)
         return kw

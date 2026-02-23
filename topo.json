@@ -2,7 +2,7 @@
   "access_list": ["A", "B", "C"],
   "access_params": {
     "A": {"ue_ap": {"bw": 300, "delay": "2ms"}},
-    "B": {"ue_ap": {"bw": 100, "delay": "10ms"}},
-    "C": {"ue_ap": {"bw": 50,  "delay": "20ms"}}
+    "B": {"ue_ap": {"bw": 120, "delay": "15ms"}},
+    "C": {"ue_ap": {"bw": 180, "delay": "6ms"}}
   }
 }

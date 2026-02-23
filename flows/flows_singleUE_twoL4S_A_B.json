@@ -1,0 +1,9 @@
+{
+  "server_ip": "10.0.40.2",
+  "duration": 60,
+  "interval": 0.25,
+  "flows": [
+    {"ue": 1, "access": "A", "cc": "prague", "tag": "ue1_A_l4s", "parallel": 1},
+    {"ue": 1, "access": "B", "cc": "prague", "tag": "ue1_B_l4s", "parallel": 1}
+  ]
+}

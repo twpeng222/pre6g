@@ -120,7 +120,6 @@ def run_experiment(net, topo, args):
         err_dir=args.err_dir,
     )
 
-
     # ---- start monitors: per-UE (uec / uel for cwnd) + ueshell for link bytes ----
     mon_outs = []
     for ue in sorted(set(x["ue"] for x in runtime)):
@@ -252,6 +251,32 @@ def run_experiment(net, topo, args):
 
     (Path(args.err_dir) / "bg").mkdir(parents=True, exist_ok=True)
 
+    # ---- start DRP scheduler (IETF pattern default OFF) ----
+    use_drp = (getattr(args, "bn_drp", "") == "ietf")
+    t0_mono = None
+    drp_log = None
+    wait_exec = None
+
+    if use_drp:
+        wait_exec = ensure_wait_exec(outdir)
+
+        # 留 2 秒讓背景監控 ready
+        t0_mono = time.monotonic() + 2.0
+        print("[T0] monotonic start at:", t0_mono)
+        print("[T0] wait_exec:", wait_exec)
+
+        # 啟動 DRP（用同一個 t0_mono）
+        high, low, vlow = 100, 60, 30
+        drp_log = start_bn_drp_scheduler(
+            r, bn_dev, outdir,
+            burst_kb=int(args.bn_burst_kb),
+            latency_ms=int(args.bn_latency_ms),
+            high=high, low=low, vlow=vlow,
+            step_s=float(getattr(args, "bn_drp_step_s", 1.0)),
+            t0_mono=t0_mono,
+        )
+        print("[DRP] enabled ietf pattern, log:", drp_log)
+
 
     # ---- start clients (STEP 1: send from ue{ue}c / ue{ue}l, not ue_shell) ----
     for x in runtime:
@@ -283,7 +308,17 @@ def run_experiment(net, topo, args):
         iperf_err  = str(Path(args.err_dir) / "bg" / f"iperf_{x['tag']}.err")
 
         client.cmd(f"rm -f {iperf_json} {iperf_err} 2>/dev/null || true")
-        pid = client.cmd(f"bash -lc '{cmd} >{iperf_json} 2>{iperf_err} & echo $!'").strip()
+
+        if not use_drp:
+            pid = client.cmd(f"bash -lc '{cmd} >{iperf_json} 2>{iperf_err} & echo $!'").strip()
+        else:
+            # cmd 目前是 "iperf3 ... -C xxx"
+            # 我們用 bash -lc 去執行：python3 wait_exec.py --t0 T0 -- <iperf3 ...>
+            wrapped = f"python3 -u {wait_exec} --t0 {t0_mono} -- {cmd}"
+            pid = client.cmd(f"bash -lc '{wrapped} >{iperf_json} 2>{iperf_err} & echo $!'").strip()
+
+
+
         alive = client.cmd(f"bash -lc 'ps -p {pid} -o pid=,cmd= 2>/dev/null || echo DEAD'").strip()
         print(f"[BG] {client.name} tag=iperf_{x['tag']} pid={pid} alive_check={alive}")
 
@@ -382,6 +417,7 @@ def run_experiment(net, topo, args):
             "cwnd_samples_classic": [rel(p) for p in cwnd_c_samples],
             "cwnd_samples_l4s": [rel(p) for p in cwnd_l_samples],
             "iperf_json": [rel(str(Path(args.raw_dir)/"iperf"/f"iperf_{x['tag']}.json")) for x in runtime],
+            "drp_events_jsonl": rel(drp_log) if drp_log else None,
         },
 
         # 新增：validation
@@ -567,11 +603,6 @@ while True:
     ).strip()
 
     return {"pid": pid, "out": outpath, "err": errpath, "script": script_path, "chk": chk}
-
-
-
-
-
 
 
 
@@ -959,3 +990,116 @@ def configure_host(host, cc, ecn=True):
     if cc == 'prague':
         host.cmd('sysctl -w net.ipv4.tcp_ecn=3')  # ECN for L4S
         host.cmd('sysctl -w net.ipv4.tcp_ecn_fallback=1')
+
+
+# DRP helpers
+import threading
+
+def _tbf_change_rate(r, dev, rate_mbit, burst_kb, latency_ms):
+    cmd = (
+        f"tc qdisc change dev {dev} parent 1: handle 2: "
+        f"tbf rate {rate_mbit}mbit burst {burst_kb}kb latency {latency_ms}ms"
+    )
+    r.cmd(cmd)
+
+def _build_ietf_drp(high, low, vlow, step_s):
+    events = []
+    # t1..t4 jumps: (t_rel, rate)
+    events += [(0, low), (40, high), (60, vlow), (80, low)]
+
+    # t5 ramp low -> high (100~120)
+    T = 20.0
+    n = max(1, int(round(T / step_s)))
+    for i in range(1, n + 1):
+        t = 100.0 + i * step_s
+        rate = low + (high - low) * (i / n)
+        events.append((t, rate))
+
+    # t6 ramp high -> low (120~140)
+    for i in range(1, n + 1):
+        t = 120.0 + i * step_s
+        rate = high + (low - high) * (i / n)
+        events.append((t, rate))
+
+    # t7 hold low (140~160)
+    events.append((140.0, low))
+    return events
+
+def start_bn_drp_scheduler(r, dev, outdir, burst_kb, latency_ms, high, low, vlow, step_s, t0_mono):
+    events_dir = Path(outdir) / "10_raw" / "events"
+    events_dir.mkdir(parents=True, exist_ok=True)
+    log_path = events_dir / "bn_drp.jsonl"
+
+    events = _build_ietf_drp(high, low, vlow, step_s)
+
+    def worker():
+        # 等到共同起跑點
+        while True:
+            now = time.monotonic()
+            dt = t0_mono - now
+            if dt <= 0:
+                break
+            time.sleep(min(0.05, dt))
+
+        for (t_rel, rate) in events:
+            target = t0_mono + float(t_rel)
+            now = time.monotonic()
+            dt = target - now
+            if dt > 0:
+                time.sleep(dt)
+
+            r_mbit = int(round(rate))
+            _tbf_change_rate(r, dev, r_mbit, burst_kb, latency_ms)
+
+            rec = {
+                "t": float(t_rel),
+                "rate_mbit": int(r_mbit),
+                "pattern": "ietf",
+                "t0_mono": float(t0_mono),
+            }
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+
+    th = threading.Thread(target=worker, daemon=True)
+    th.start()
+    return str(log_path)
+
+
+def ensure_wait_exec(outdir: str) -> str:
+    p = Path(outdir) / "00_meta" / "bin"
+    p.mkdir(parents=True, exist_ok=True)
+    script = p / "wait_exec.py"
+    script.write_text(
+        """#!/usr/bin/env python3
+import argparse, os, shlex, time, sys
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--t0", type=float, required=True, help="CLOCK_MONOTONIC absolute time")
+    ap.add_argument("cmd", nargs=argparse.REMAINDER)
+    a = ap.parse_args()
+
+    if not a.cmd or a.cmd[0] != "--":
+        print("usage: wait_exec.py --t0 <T0> -- <cmd...>", file=sys.stderr)
+        return 2
+    cmd = a.cmd[1:]
+    if not cmd:
+        print("empty cmd", file=sys.stderr)
+        return 2
+
+    # wait until T0 (monotonic)
+    while True:
+        dt = a.t0 - time.monotonic()
+        if dt <= 0:
+            break
+        time.sleep(0.001 if dt < 0.05 else 0.01)
+
+    os.execvp(cmd[0], cmd)
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+""",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return str(script)

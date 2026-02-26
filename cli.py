@@ -29,6 +29,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--aqm", type=str, default="none", choices=["none", "dualpi2", "fq_codel", "pie", "pfifo"], help="AQM to apply on shared bottleneck (r->server egress).")
     p.add_argument("--dualpi2-target-ms", type=int, default=15, help="DualPI2 target delay (ms)")
     p.add_argument("--dualpi2-tupdate-ms", type=int, default=16, help="DualPI2 tupdate (ms)")
+    p.add_argument("--bn-drp", type=str, default="",
+              help="bottleneck DataRate-Pattern. use 'ietf' to enable the paper pattern")
+    p.add_argument("--bn-drp-step-s", type=float, default=1.0,
+              help="ramp step in seconds (1.0 recommended)")
     return p
 
 

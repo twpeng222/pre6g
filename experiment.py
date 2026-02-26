@@ -317,8 +317,6 @@ def run_experiment(net, topo, args):
             wrapped = f"python3 -u {wait_exec} --t0 {t0_mono} -- {cmd}"
             pid = client.cmd(f"bash -lc '{wrapped} >{iperf_json} 2>{iperf_err} & echo $!'").strip()
 
-
-
         alive = client.cmd(f"bash -lc 'ps -p {pid} -o pid=,cmd= 2>/dev/null || echo DEAD'").strip()
         print(f"[BG] {client.name} tag=iperf_{x['tag']} pid={pid} alive_check={alive}")
 
